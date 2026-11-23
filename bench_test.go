@@ -124,7 +124,7 @@ func BenchmarkIterate10k(b *testing.B) {
 	}
 	b.ReportAllocs()
 	for b.Loop() {
-		for range bk.All() {
+		for range bk.All().Seq() {
 		}
 	}
 }

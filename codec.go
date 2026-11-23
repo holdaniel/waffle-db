@@ -103,7 +103,11 @@ var valOpCache sync.Map // reflect.Type -> *valOp
 
 var (
 	binaryAppenderType    = reflect.TypeFor[encoding.BinaryAppender]()
+	binaryMarshalerType   = reflect.TypeFor[encoding.BinaryMarshaler]()
 	binaryUnmarshalerType = reflect.TypeFor[encoding.BinaryUnmarshaler]()
+	textAppenderType      = reflect.TypeFor[encoding.TextAppender]()
+	textMarshalerType     = reflect.TypeFor[encoding.TextMarshaler]()
+	textUnmarshalerType   = reflect.TypeFor[encoding.TextUnmarshaler]()
 )
 
 func compileValOp(t reflect.Type) (*valOp, error) {
@@ -118,15 +122,42 @@ func compileValOp(t reflect.Type) (*valOp, error) {
 	return actual.(*valOp), nil
 }
 
-// encodedFields lists the struct fields that participate in encoding.
+// encodedFields lists the struct fields that participate in encoding:
+// exported fields plus embedded structs (exported or not, since their
+// exported fields are promoted, as with encoding/json), minus fields tagged
+// `waffle:"-"`.
 func encodedFields(t reflect.Type) []reflect.StructField {
 	var out []reflect.StructField
 	for i := range t.NumField() {
 		f := t.Field(i)
-		if !f.IsExported() || f.Tag.Get("waffle") == "-" {
+		if f.Tag.Get("waffle") == "-" || !f.IsExported() && !isEmbeddedStruct(f) {
 			continue
 		}
 		out = append(out, f)
+	}
+	return out
+}
+
+func isEmbeddedStruct(f reflect.StructField) bool {
+	if !f.Anonymous {
+		return false
+	}
+	ft := f.Type
+	if ft.Kind() == reflect.Pointer {
+		ft = ft.Elem()
+	}
+	return ft.Kind() == reflect.Struct
+}
+
+// hiddenFields names the fields that hold data but are not encoded:
+// unexported, not embedded, and not explicitly skipped with `waffle:"-"`.
+func hiddenFields(t reflect.Type) []string {
+	var out []string
+	for i := range t.NumField() {
+		f := t.Field(i)
+		if !f.IsExported() && !isEmbeddedStruct(f) && f.Tag.Get("waffle") != "-" && f.Type.Size() > 0 {
+			out = append(out, f.Name)
+		}
 	}
 	return out
 }
@@ -179,9 +210,8 @@ func buildValOp(t reflect.Type, seen map[reflect.Type]*valOp) (*valOp, error) {
 	op := &valOp{}
 	seen[t] = op
 
-	pt := reflect.PointerTo(t)
-	if pt.Implements(binaryAppenderType) && pt.Implements(binaryUnmarshalerType) {
-		*op = binaryMarshalerOp(t)
+	if mop, ok := binaryMarshalerOp(t); ok {
+		*op = mop
 		return op, nil
 	}
 
@@ -462,6 +492,19 @@ func buildValOp(t reflect.Type, seen map[reflect.Type]*valOp) (*valOp, error) {
 
 	case reflect.Struct:
 		fields := encodedFields(t)
+		if len(fields) == 0 && t.Size() > 0 {
+			// All state is in unexported fields (e.g. big.Int-like types).
+			// Field-wise encoding would silently store nothing, so use the
+			// type's own text form if it has one, or refuse.
+			if mop, ok := textMarshalerOp(t); ok {
+				*op = mop
+				break
+			}
+			delete(seen, t)
+			return nil, fmt.Errorf("waffle: type %s has no exported fields (unexported: %v), so its data would be lost; "+
+				"implement encoding.BinaryMarshaler/BinaryUnmarshaler or TextMarshaler/TextUnmarshaler, or supply a Codec",
+				t, hiddenFields(t))
+		}
 		ops := make([]*valOp, len(fields))
 		offs := make([]uintptr, len(fields))
 		for i, f := range fields {
@@ -507,12 +550,56 @@ func buildValOp(t reflect.Type, seen map[reflect.Type]*valOp) (*valOp, error) {
 	return op, nil
 }
 
-func binaryMarshalerOp(t reflect.Type) valOp {
+// binaryMarshalerOp uses the type's own binary encoding when *T implements
+// BinaryUnmarshaler and either BinaryAppender or BinaryMarshaler.
+func binaryMarshalerOp(t reflect.Type) (valOp, bool) {
+	pt := reflect.PointerTo(t)
+	if !pt.Implements(binaryUnmarshalerType) {
+		return valOp{}, false
+	}
+	dec := func(v any, b []byte) error { return v.(encoding.BinaryUnmarshaler).UnmarshalBinary(b) }
+	switch {
+	case pt.Implements(binaryAppenderType):
+		return marshalerOp(t, func(v any, dst []byte) ([]byte, error) {
+			return v.(encoding.BinaryAppender).AppendBinary(dst)
+		}, dec), true
+	case pt.Implements(binaryMarshalerType):
+		return marshalerOp(t, func(v any, dst []byte) ([]byte, error) {
+			b, err := v.(encoding.BinaryMarshaler).MarshalBinary()
+			return append(dst, b...), err
+		}, dec), true
+	}
+	return valOp{}, false
+}
+
+// textMarshalerOp is like binaryMarshalerOp for the text interfaces.
+func textMarshalerOp(t reflect.Type) (valOp, bool) {
+	pt := reflect.PointerTo(t)
+	if !pt.Implements(textUnmarshalerType) {
+		return valOp{}, false
+	}
+	dec := func(v any, b []byte) error { return v.(encoding.TextUnmarshaler).UnmarshalText(b) }
+	switch {
+	case pt.Implements(textAppenderType):
+		return marshalerOp(t, func(v any, dst []byte) ([]byte, error) {
+			return v.(encoding.TextAppender).AppendText(dst)
+		}, dec), true
+	case pt.Implements(textMarshalerType):
+		return marshalerOp(t, func(v any, dst []byte) ([]byte, error) {
+			b, err := v.(encoding.TextMarshaler).MarshalText()
+			return append(dst, b...), err
+		}, dec), true
+	}
+	return valOp{}, false
+}
+
+// marshalerOp frames a type's self-encoding with a uvarint length prefix.
+// The callbacks receive a *T as an interface (no allocation: pointer-shaped).
+func marshalerOp(t reflect.Type, appendFn func(v any, dst []byte) ([]byte, error), decodeFn func(v any, b []byte) error) valOp {
 	return valOp{
 		enc: func(dst []byte, p unsafe.Pointer) ([]byte, error) {
-			a := reflect.NewAt(t, p).Interface().(encoding.BinaryAppender)
 			mark := len(dst)
-			dst, err := a.AppendBinary(dst)
+			dst, err := appendFn(reflect.NewAt(t, p).Interface(), dst)
 			if err != nil {
 				return dst, err
 			}
@@ -530,8 +617,7 @@ func binaryMarshalerOp(t reflect.Type) valOp {
 			if err != nil {
 				return 0, err
 			}
-			u := reflect.NewAt(t, p).Interface().(encoding.BinaryUnmarshaler)
-			if err := u.UnmarshalBinary(src[n : n+l]); err != nil {
+			if err := decodeFn(reflect.NewAt(t, p).Interface(), src[n:n+l]); err != nil {
 				return 0, err
 			}
 			return n + l, nil

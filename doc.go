@@ -9,7 +9,9 @@
 //
 //	users.Put(42, User{Name: "Ada"})
 //	u, ok, _ := users.Get(42)
-//	for id, u := range users.All() { ... }
+//	it := users.All()
+//	for id, u := range it.Seq() { ... }
+//	if err := it.Err(); err != nil { ... }
 //
 // Design in three layers:
 //
@@ -25,7 +27,8 @@
 //   - Storage is a single append-only log of CRC-checked frames with an
 //     in-memory ordered index of keys to value offsets. Each commit is one
 //     frame, so transactions are atomic and crash recovery is a replay that
-//     drops a torn tail. Compact reclaims space from overwritten data.
+//     drops a torn tail (but refuses to discard data after mid-file
+//     corruption). Compact reclaims space from overwritten data.
 //
 // Buckets live in a DB or in a Namespace; namespaces nest, giving each
 // tenant or subsystem its own isolated key space that can be dropped

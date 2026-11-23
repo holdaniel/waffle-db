@@ -63,7 +63,7 @@ func TestOrderedIteration(t *testing.T) {
 		must(t, b.Put(i, fmt.Sprint(i)))
 	}
 	var keys []int
-	for k, v := range b.All() {
+	for k, v := range b.All().Seq() {
 		if v != fmt.Sprint(k) {
 			t.Fatalf("value mismatch %d %q", k, v)
 		}
@@ -73,14 +73,14 @@ func TestOrderedIteration(t *testing.T) {
 		t.Fatalf("order: %v", keys)
 	}
 	keys = keys[:0]
-	for k := range b.Range(-3, 42) {
+	for k := range b.Range(-3, 42).Seq() {
 		keys = append(keys, k)
 	}
 	if !slices.Equal(keys, []int{-3, 0, 5}) {
 		t.Fatalf("range: %v", keys)
 	}
 	// early break
-	for k := range b.From(0) {
+	for k := range b.From(0).Seq() {
 		if k != 0 {
 			t.Fatal("from")
 		}
@@ -96,7 +96,7 @@ func TestIterationLargerThanChunk(t *testing.T) {
 		must(t, b.Put(i, i*2))
 	}
 	var i uint32
-	for k, v := range b.All() {
+	for k, v := range b.All().Seq() {
 		if k != i || v != i*2 {
 			t.Fatalf("at %d got %d=%d", i, k, v)
 		}
@@ -113,7 +113,7 @@ func TestWriteDuringIteration(t *testing.T) {
 	for i := range 300 {
 		must(t, b.Put(i, i))
 	}
-	for k, v := range b.All() { // must not deadlock
+	for k, v := range b.All().Seq() { // must not deadlock
 		must(t, b.Put(k, v+1))
 	}
 	v, _, _ := b.Get(299)
@@ -135,15 +135,15 @@ func TestCompositeKeyPrefix(t *testing.T) {
 			must(t, orders.Put(OrderKey{u, t0.Add(time.Duration(3-d) * time.Hour)}, float64(u)))
 		}
 	}
-	seq, err := orders.Prefix(OrderKey{UserID: 2}, 1)
-	must(t, err)
+	it := orders.Prefix(OrderKey{UserID: 2}, 1)
 	var got []time.Time
-	for k, v := range seq {
+	for k, v := range it.Seq() {
 		if k.UserID != 2 || v != 2 {
 			t.Fatalf("leaked %+v", k)
 		}
 		got = append(got, k.At)
 	}
+	must(t, it.Err())
 	if len(got) != 4 || !slices.IsSortedFunc(got, time.Time.Compare) {
 		t.Fatalf("prefix scan: %v", got)
 	}
@@ -155,12 +155,12 @@ func TestStringPrefix(t *testing.T) {
 	for i, k := range []string{"app", "apple", "apply", "apricot", "banana", "ap"} {
 		must(t, b.Put(k, i))
 	}
-	seq, err := b.Prefix("app", 0)
-	must(t, err)
+	it := b.Prefix("app", 0)
 	var keys []string
-	for k := range seq {
+	for k := range it.Keys() {
 		keys = append(keys, k)
 	}
+	must(t, it.Err())
 	if !slices.Equal(keys, []string{"app", "apple", "apply"}) {
 		t.Fatalf("got %v", keys)
 	}
@@ -214,7 +214,7 @@ func TestTransactions(t *testing.T) {
 			must(t, a.Update("bob", func(v int, _ bool) (int, error) { return v + amount, nil }))
 			// read-your-writes, including in scans
 			sum := 0
-			for _, v := range a.All() {
+			for _, v := range a.All().Seq() {
 				sum += v
 			}
 			if sum != 100 {
@@ -248,7 +248,7 @@ func TestTxScanMerge(t *testing.T) {
 		must(t, bt.Delete(3))
 		must(t, bt.Put(9, 9))
 		var got [][2]int
-		for k, v := range bt.All() {
+		for k, v := range bt.All().Seq() {
 			got = append(got, [2]int{k, v})
 		}
 		want := [][2]int{{0, 0}, {1, 1}, {4, 4}, {5, 50}, {7, 7}, {9, 9}}
@@ -391,7 +391,7 @@ func TestConcurrentReadersWriters(t *testing.T) {
 	for range 4 {
 		wg.Go(func() {
 			for range 50 {
-				for range b.All() {
+				for range b.All().Seq() {
 				}
 				_, _, _ = b.Get(3)
 			}

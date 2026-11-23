@@ -121,7 +121,7 @@ func buildKeyOp(t reflect.Type, visiting map[reflect.Type]bool) (*keyOp, error) 
 	case reflect.Float32:
 		return &keyOp{
 			enc: func(dst []byte, p unsafe.Pointer) []byte {
-				return binary.BigEndian.AppendUint32(dst, uint32(orderFloat(uint64(math.Float32bits(*(*float32)(p))), 32)))
+				return binary.BigEndian.AppendUint32(dst, uint32(orderFloat(canonFloat32(*(*float32)(p)), 32)))
 			},
 			dec: func(src []byte, p unsafe.Pointer) (int, error) {
 				if len(src) < 4 {
@@ -135,7 +135,7 @@ func buildKeyOp(t reflect.Type, visiting map[reflect.Type]bool) (*keyOp, error) 
 	case reflect.Float64:
 		return &keyOp{
 			enc: func(dst []byte, p unsafe.Pointer) []byte {
-				return binary.BigEndian.AppendUint64(dst, orderFloat(math.Float64bits(*(*float64)(p)), 64))
+				return binary.BigEndian.AppendUint64(dst, orderFloat(canonFloat64(*(*float64)(p)), 64))
 			},
 			dec: func(src []byte, p unsafe.Pointer) (int, error) {
 				if len(src) < 8 {
@@ -219,8 +219,16 @@ func buildKeyOp(t reflect.Type, visiting map[reflect.Type]bool) (*keyOp, error) 
 		}
 		visiting[t] = true
 		defer delete(visiting, t)
+		if hidden := hiddenFields(t); len(hidden) > 0 {
+			return nil, fmt.Errorf("waffle: key type %s has unexported fields %v that would not be part of the key, "+
+				"so distinct keys could collide; export them or tag them `waffle:\"-\"`", t, hidden)
+		}
 		op := &keyOp{}
-		for _, f := range encodedFields(t) {
+		sfields := encodedFields(t)
+		if len(sfields) == 0 && t.Size() > 0 {
+			return nil, fmt.Errorf("waffle: key type %s has no encodable fields; every key would be identical", t)
+		}
+		for _, f := range sfields {
 			fop, err := buildKeyOp(f.Type, visiting)
 			if err != nil {
 				return nil, fmt.Errorf("field %s.%s: %w", t, f.Name, err)
@@ -326,6 +334,29 @@ func readUintBE(src []byte, size uintptr) uint64 {
 	default:
 		return binary.BigEndian.Uint64(src)
 	}
+}
+
+// canonFloat64 returns the bits of f with -0 folded into +0 and every NaN
+// folded into one canonical NaN, so keys that compare equal (or are both
+// NaN) map to the same bytes. NaN sorts after +Inf.
+func canonFloat64(f float64) uint64 {
+	switch {
+	case f == 0:
+		return 0
+	case f != f:
+		return 0x7FF8000000000001
+	}
+	return math.Float64bits(f)
+}
+
+func canonFloat32(f float32) uint64 {
+	switch {
+	case f == 0:
+		return 0
+	case f != f:
+		return 0x7FC00001
+	}
+	return uint64(math.Float32bits(f))
 }
 
 // orderFloat maps IEEE-754 bits so that unsigned byte order matches numeric

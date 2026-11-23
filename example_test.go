@@ -46,9 +46,12 @@ func Example() {
 	_ = buy("alice", t0.Add(2*time.Hour))
 	_ = buy("alice", t0)
 
-	aliceOrders, _ := orders.Prefix(OrderKey{Customer: "alice"}, 1)
-	for k, o := range aliceOrders {
+	aliceOrders := orders.Prefix(OrderKey{Customer: "alice"}, 1)
+	for k, o := range aliceOrders.Seq() {
 		fmt.Println(k.Customer, k.At.Format(time.Kitchen), o.Item, o.Cents)
+	}
+	if err := aliceOrders.Err(); err != nil {
+		fmt.Println("error:", err)
 	}
 	left, _, _ := stock.Get("waffle")
 	fmt.Println("left:", left)

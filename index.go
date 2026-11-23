@@ -93,12 +93,35 @@ func (ix *index) set(key []byte, off int64, vlen uint32) {
 	ix.live += recordSize(len(key), vlen)
 }
 
+// anyInRange reports whether some key lies in [lo, hi) (hi == nil: unbounded).
+func (ix *index) anyInRange(lo, hi []byte) bool {
+	n := ix.seek(lo, nil)
+	return n != nil && (hi == nil || bytes.Compare(n.key, hi) < 0)
+}
+
+// deleteRange removes every key in [lo, hi) (hi == nil: unbounded).
+func (ix *index) deleteRange(lo, hi []byte) {
+	var preds [maxLevel]*node
+	for {
+		n := ix.seek(lo, &preds)
+		if n == nil || (hi != nil && bytes.Compare(n.key, hi) >= 0) {
+			return
+		}
+		ix.unlink(n, &preds)
+	}
+}
+
 func (ix *index) delete(key []byte) bool {
 	var preds [maxLevel]*node
 	n := ix.seek(key, &preds)
 	if n == nil || !bytes.Equal(n.key, key) {
 		return false
 	}
+	ix.unlink(n, &preds)
+	return true
+}
+
+func (ix *index) unlink(n *node, preds *[maxLevel]*node) {
 	for i := range len(n.next) {
 		if preds[i].next[i] == n {
 			preds[i].next[i] = n.next[i]
@@ -109,5 +132,4 @@ func (ix *index) delete(key []byte) bool {
 	}
 	ix.n--
 	ix.live -= recordSize(len(n.key), n.vlen)
-	return true
 }

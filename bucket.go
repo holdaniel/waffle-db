@@ -16,6 +16,7 @@ type store interface {
 	get(key, dst []byte) ([]byte, bool, error)
 	put(key, val []byte) error
 	del(key []byte) error
+	delRange(lo, hi []byte) error
 	scan(lo, hi []byte, keysOnly bool, fn func(k, v []byte) bool) error
 }
 
@@ -79,27 +80,11 @@ func (ns *Namespace) Namespace(name string) *Namespace {
 func (ns *Namespace) parentPrefix() []byte { return ns.prefix }
 func (ns *Namespace) parentDB() *DB        { return ns.db }
 
-// Drop atomically deletes every bucket and namespace inside ns.
+// Drop atomically deletes every bucket and namespace inside ns. It writes a
+// single range-delete record, so its cost does not depend on how much data
+// the namespace holds.
 func (ns *Namespace) Drop() error {
-	return ns.db.Update(func(tx *Tx) error {
-		return deleteRange(tx, ns.prefix, prefixEnd(ns.prefix))
-	})
-}
-
-func deleteRange(s store, lo, hi []byte) error {
-	var keys [][]byte
-	if err := s.scan(lo, hi, true, func(k, _ []byte) bool {
-		keys = append(keys, bytes.Clone(k))
-		return true
-	}); err != nil {
-		return err
-	}
-	for _, k := range keys {
-		if err := s.del(k); err != nil {
-			return err
-		}
-	}
-	return nil
+	return ns.db.delRange(ns.prefix, prefixEnd(ns.prefix))
 }
 
 // BucketOption customises NewBucket.
@@ -316,12 +301,10 @@ func (b *Bucket[K, V]) update(tx *Tx, k K, fn func(V, bool) (V, error)) error {
 	return bt.Put(k, v)
 }
 
-// Clear deletes every entry in the bucket atomically.
+// Clear deletes every entry in the bucket atomically. It writes a single
+// range-delete record, so its cost does not depend on the bucket's size.
 func (b *Bucket[K, V]) Clear() error {
-	if tx, ok := b.s.(*Tx); ok {
-		return deleteRange(tx, b.prefix, b.end)
-	}
-	return b.db.Update(func(tx *Tx) error { return deleteRange(tx, b.prefix, b.end) })
+	return b.s.delRange(b.prefix, b.end)
 }
 
 // Count returns the number of entries (by walking the keys).
@@ -339,7 +322,6 @@ type Bounds[K any] struct {
 
 // Scan calls fn for each entry within bounds, in key order, stopping at the
 // first error. Returning ErrStop from fn ends the scan without an error.
-// Scan is the error-returning counterpart of the iterator methods.
 func (b *Bucket[K, V]) Scan(bounds Bounds[K], fn func(k K, v V) error) error {
 	lo, hi := b.prefix, b.end
 	if bounds.From != nil {
@@ -385,67 +367,94 @@ func (b *Bucket[K, V]) iterate(lo, hi []byte, keysOnly bool, fn func(K, V) bool)
 	return err
 }
 
-// IterError is the panic value raised by the iterator methods (All, Range,
-// Prefix, Keys) when the underlying scan fails, which only happens on I/O
-// errors, corrupt data, or a closed database. Use Scan to receive such
-// errors as return values instead.
-type IterError struct{ Err error }
+// Iter is a range over a bucket. Range over Seq (or Keys), then check Err,
+// the same way you would use bufio.Scanner:
+//
+//	it := users.All()
+//	for id, u := range it.Seq() {
+//		...
+//	}
+//	if err := it.Err(); err != nil {
+//		...
+//	}
+//
+// Iteration stops at the first error (I/O failure, corrupt data, a closed
+// database or a finished transaction); it never panics. An Iter can be
+// ranged over more than once; each pass re-reads the data. It is not safe
+// for concurrent use.
+type Iter[K, V any] struct {
+	b        *Bucket[K, V]
+	lo, hi   []byte
+	setupErr error
+	err      error
+}
 
-func (e *IterError) Error() string { return "waffle: iteration failed: " + e.Err.Error() }
-func (e *IterError) Unwrap() error { return e.Err }
-
-func (b *Bucket[K, V]) seq(lo, hi []byte, keysOnly bool) iter.Seq2[K, V] {
+// Seq yields each entry in key order.
+func (it *Iter[K, V]) Seq() iter.Seq2[K, V] {
 	return func(yield func(K, V) bool) {
-		if err := b.iterate(lo, hi, keysOnly, yield); err != nil {
-			panic(&IterError{err})
+		if it.setupErr != nil {
+			return
 		}
+		it.err = it.b.iterate(it.lo, it.hi, false, yield)
 	}
 }
 
-// All iterates over every entry in key order.
-func (b *Bucket[K, V]) All() iter.Seq2[K, V] { return b.seq(b.prefix, b.end, false) }
-
-// Keys iterates over every key in order without reading values.
-func (b *Bucket[K, V]) Keys() iter.Seq[K] {
+// Keys yields each key in order without reading or decoding values.
+func (it *Iter[K, V]) Keys() iter.Seq[K] {
 	return func(yield func(K) bool) {
-		for k := range b.seq(b.prefix, b.end, true) {
-			if !yield(k) {
-				return
-			}
+		if it.setupErr != nil {
+			return
 		}
+		it.err = it.b.iterate(it.lo, it.hi, true, func(k K, _ V) bool { return yield(k) })
 	}
 }
 
-// Range iterates over keys in [from, to).
-func (b *Bucket[K, V]) Range(from, to K) iter.Seq2[K, V] {
-	return b.seq(b.key(nil, from), b.key(nil, to), false)
+// Err returns the error that ended the most recent pass, if any.
+func (it *Iter[K, V]) Err() error {
+	if it.setupErr != nil {
+		return it.setupErr
+	}
+	return it.err
 }
 
-// From iterates over keys >= from.
-func (b *Bucket[K, V]) From(from K) iter.Seq2[K, V] {
-	return b.seq(b.key(nil, from), b.end, false)
+func (b *Bucket[K, V]) newIter(lo, hi []byte) *Iter[K, V] {
+	return &Iter[K, V]{b: b, lo: lo, hi: hi}
 }
 
-// Prefix iterates over keys sharing a prefix with partial.
+// All ranges over every entry in key order.
+func (b *Bucket[K, V]) All() *Iter[K, V] { return b.newIter(b.prefix, b.end) }
+
+// Range ranges over keys in [from, to).
+func (b *Bucket[K, V]) Range(from, to K) *Iter[K, V] {
+	return b.newIter(b.key(nil, from), b.key(nil, to))
+}
+
+// From ranges over keys >= from.
+func (b *Bucket[K, V]) From(from K) *Iter[K, V] {
+	return b.newIter(b.key(nil, from), b.end)
+}
+
+// Prefix ranges over keys sharing a prefix with partial.
 //
 //   - Struct keys: entries whose first `fields` fields equal those of
 //     partial (e.g. all orders of one user for key struct{User, OrderID}).
 //   - String / []byte keys: entries whose key starts with partial; fields is
 //     ignored.
 //
-// It returns an error for other key types or an out-of-range field count.
-func (b *Bucket[K, V]) Prefix(partial K, fields int) (iter.Seq2[K, V], error) {
+// For other key types or an out-of-range field count, the returned Iter
+// yields nothing and its Err reports why.
+func (b *Bucket[K, V]) Prefix(partial K, fields int) *Iter[K, V] {
 	pc, ok := b.kc.(prefixKeyCodec[K])
 	if !ok {
-		return nil, errors.New("waffle: Prefix is not supported by a custom key codec")
+		return &Iter[K, V]{setupErr: errors.New("waffle: Prefix is not supported by a custom key codec")}
 	}
 	lo, err := pc.appendPrefix(bytes.Clone(b.prefix), partial, fields)
 	if err != nil {
-		return nil, err
+		return &Iter[K, V]{setupErr: err}
 	}
 	hi := prefixEnd(lo)
 	if hi == nil {
 		hi = b.end
 	}
-	return b.seq(lo, hi, false), nil
+	return b.newIter(lo, hi)
 }
