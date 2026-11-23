@@ -1,0 +1,23 @@
+README.md
+  s_79829843c838d1::t_77cb5940ba1654 65
+db.go
+  s_79829843c838d1::t_2d4ae5b03038cc 176-177,313
+bucket.go
+  s_79829843c838d1::t_127ca565a0a9e6 396
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.11",
+  "base_commit_sha": "a3cd80a0c572f6ff6e2742139973d7c5a88433de",
+  "prompts": {},
+  "sessions": {
+    "s_79829843c838d1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d1df6060-7f2e-4933-a1f2-c91865275816",
+        "model": "unknown"
+      },
+      "human_author": "Holong Daniel Tony <holong.tony@tiket.com>"
+    }
+  }
+}
