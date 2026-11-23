@@ -3,6 +3,7 @@ package waffle
 import (
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 type benchUser struct {
@@ -126,5 +127,33 @@ func BenchmarkIterate10k(b *testing.B) {
 	for b.Loop() {
 		for range bk.All().Seq() {
 		}
+	}
+}
+
+func BenchmarkIterate10kReverse(b *testing.B) {
+	db := OpenMemory()
+	bk := MustBucket[uint64, uint64](db, "n")
+	for i := range uint64(10000) {
+		_ = bk.Put(i, i)
+	}
+	b.ReportAllocs()
+	for b.Loop() {
+		for range bk.All().Reverse().Seq() {
+		}
+	}
+}
+
+func BenchmarkPutTTL(b *testing.B) {
+	db, err := Open(filepath.Join(b.TempDir(), "b.db"), nil)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer db.Close()
+	bk := MustBucket[uint64, uint64](db, "n", WithTTL(time.Hour))
+	b.ReportAllocs()
+	i := uint64(0)
+	for b.Loop() {
+		_ = bk.Put(i%10000, i)
+		i++
 	}
 }

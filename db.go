@@ -8,9 +8,11 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 )
 
 // On-disk layout
@@ -23,6 +25,12 @@ import (
 //	op     := 0x01 klen:uvarint key vlen:uvarint value     (put)
 //	        | 0x02 klen:uvarint key                        (delete)
 //	        | 0x03 klen:uvarint lo  hlen:uvarint hi        (delete [lo, hi); hlen 0 = unbounded)
+//	        | 0x04 klen:uvarint key exp:uvarint vlen:uvarint value
+//	                                                       (put expiring at exp, unix ns)
+//
+// An expiring put whose time has passed is replayed as a delete, so expired
+// entries never come back, and they can be dropped from the in-memory index
+// at any time without writing anything (see PurgeExpired).
 //
 // Every commit (a single Put or a whole Update transaction) is exactly one
 // frame, so commits are atomic. On open the log is replayed. A damaged frame
@@ -39,6 +47,7 @@ const (
 	opPut      = 0x01
 	opDel      = 0x02
 	opDelRange = 0x03
+	opPutTTL   = 0x04
 	maxFrame   = 1<<31 - 1
 )
 
@@ -80,7 +89,15 @@ type Options struct {
 	// database that fails to open with a *CorruptionError, after taking a
 	// copy of the file.
 	TruncateCorrupt bool
+
+	// Now overrides the clock used for TTL expiry; nil means time.Now. Handy
+	// for testing expiry without sleeping.
+	Now func() time.Time
 }
+
+// MemoryPath, passed to Open, creates an in-memory database (like SQLite's
+// ":memory:"). It behaves exactly like a file-backed one.
+const MemoryPath = ":memory:"
 
 // DB is a single-file, ordered, transactional key-value store. Use it through
 // typed Buckets; see NewBucket.
@@ -100,12 +117,28 @@ type DB struct {
 	closed    bool
 	truncated int64
 	werr      error // sticky write failure (guarded by wmu)
+	now       func() int64
 
 	frame []byte // writer-owned scratch buffer
 }
 
-// Open opens (creating if needed) the database file at path.
+// Open opens (creating if needed) the database file at path. Pass
+// MemoryPath for an in-memory database.
 func Open(path string, opts *Options) (*DB, error) {
+	db := &DB{path: path, idx: newIndex()}
+	if opts != nil {
+		db.opts = *opts
+	}
+	db.now = func() int64 { return time.Now().UnixNano() }
+	if db.opts.Now != nil {
+		now := db.opts.Now
+		db.now = func() int64 { return now().UnixNano() }
+	}
+	if path == MemoryPath {
+		db.path, db.f = "", &memStorage{}
+		return db, db.load()
+	}
+
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o644)
 	if err != nil {
 		return nil, err
@@ -114,10 +147,7 @@ func Open(path string, opts *Options) (*DB, error) {
 		f.Close()
 		return nil, fmt.Errorf("waffle: open %s: %w", path, err)
 	}
-	db := &DB{f: f, path: path, idx: newIndex()}
-	if opts != nil {
-		db.opts = *opts
-	}
+	db.f = f
 	if err := db.load(); err != nil {
 		f.Close()
 		return nil, fmt.Errorf("waffle: open %s: %w", path, err)
@@ -125,12 +155,10 @@ func Open(path string, opts *Options) (*DB, error) {
 	return db, nil
 }
 
-// OpenMemory returns a database that lives entirely in memory. It behaves
-// exactly like a file-backed one (same encoding, transactions, compaction),
-// which makes it handy for tests and caches.
+// OpenMemory is shorthand for Open(MemoryPath, nil).
 func OpenMemory() *DB {
-	db := &DB{f: &memStorage{}, idx: newIndex()}
-	if err := db.load(); err != nil {
+	db, err := Open(MemoryPath, nil)
+	if err != nil {
 		panic(err) // cannot happen for an empty memStorage
 	}
 	return db
@@ -166,7 +194,7 @@ func (db *DB) load() error {
 	if string(hdr[:]) != magic {
 		return errors.New("not a waffle database (bad magic)")
 	}
-	good, err := replay(db.f, size, db.idx)
+	good, err := replay(db.f, size, db.idx, db.now())
 	var ce *CorruptionError
 	if errors.As(err, &ce) && db.opts.TruncateCorrupt {
 		err = nil
@@ -187,7 +215,7 @@ func (db *DB) load() error {
 // replay applies every intact frame to idx and returns the offset just past
 // the last one applied. If it stops at a damaged frame that has intact frames
 // after it, it also returns a *CorruptionError.
-func replay(f storage, size int64, idx *index) (int64, error) {
+func replay(f storage, size int64, idx *index, now int64) (int64, error) {
 	r := bufio.NewReaderSize(io.NewSectionReader(f, headerLen, size-headerLen), 1<<20)
 	off := headerLen
 	var hdr [frameHdr]byte
@@ -200,7 +228,7 @@ func replay(f storage, size int64, idx *index) (int64, error) {
 				if _, err := io.ReadFull(r, payload); err == nil &&
 					crc32.Checksum(payload, castagnoli) == pcrc &&
 					walkOps(payload, nil) == nil {
-					applyOps(idx, payload, off+frameHdr)
+					applyOps(idx, payload, off+frameHdr, now)
 					off += frameHdr + int64(n)
 					ok = true
 				}
@@ -266,65 +294,91 @@ func validFrameAfter(f storage, start, size int64) (bool, error) {
 	return false, nil
 }
 
-// walkOps validates a frame payload and, if fn is non-nil, reports each op
-// with byte positions relative to the payload. For opDelRange the "value"
-// is the exclusive upper bound.
-func walkOps(p []byte, fn func(op byte, kpos, klen, vpos, vlen int)) error {
+// logOp is one decoded log operation. key and val alias the frame payload;
+// for opDelRange, key and val are the lo and hi bounds.
+type logOp struct {
+	op     byte
+	key    []byte
+	val    []byte
+	valPos int   // offset of val within the payload
+	exp    int64 // opPutTTL only
+}
+
+// walkOps validates a frame payload and, if fn is non-nil, reports each op.
+func walkOps(p []byte, fn func(o logOp)) error {
+	var o logOp
 	pos := 0
-	for pos < len(p) {
-		op := p[pos]
-		pos++
-		klen, n := binary.Uvarint(p[pos:])
-		if n <= 0 || klen > uint64(len(p)-pos-n) {
-			return ErrCorrupt
+	readLenAt := func() (int, bool) {
+		v, n := binary.Uvarint(p[pos:])
+		if n <= 0 || v > uint64(len(p)-pos-n) {
+			return 0, false
 		}
 		pos += n
-		kpos := pos
-		pos += int(klen)
-		switch op {
+		return int(v), true
+	}
+	for pos < len(p) {
+		o = logOp{op: p[pos]}
+		pos++
+		klen, ok := readLenAt()
+		if !ok {
+			return ErrCorrupt
+		}
+		o.key = p[pos : pos+klen]
+		pos += klen
+		switch o.op {
 		case opDel:
-			if fn != nil {
-				fn(op, kpos, int(klen), 0, 0)
-			}
-		case opPut, opDelRange:
-			vlen, n := binary.Uvarint(p[pos:])
-			if n <= 0 || vlen > uint64(len(p)-pos-n) {
+		case opPutTTL:
+			exp, n := binary.Uvarint(p[pos:])
+			if n <= 0 || exp == 0 || exp > math.MaxInt64 {
 				return ErrCorrupt
 			}
+			o.exp = int64(exp)
 			pos += n
-			if fn != nil {
-				fn(op, kpos, int(klen), pos, int(vlen))
+			fallthrough
+		case opPut, opDelRange:
+			vlen, ok := readLenAt()
+			if !ok {
+				return ErrCorrupt
 			}
-			pos += int(vlen)
+			o.val, o.valPos = p[pos:pos+vlen], pos
+			pos += vlen
 		default:
 			return ErrCorrupt
+		}
+		if fn != nil {
+			fn(o) // by value: a pointer would escape to the heap on every commit
 		}
 	}
 	return nil
 }
 
 // applyOps applies an already-validated payload located at file offset base.
-func applyOps(idx *index, payload []byte, base int64) {
-	_ = walkOps(payload, func(op byte, kpos, klen, vpos, vlen int) {
-		key := payload[kpos : kpos+klen]
-		switch op {
-		case opPut:
-			idx.set(key, base+int64(vpos), uint32(vlen))
+// An expiring put that is already dead at time now acts as a delete.
+func applyOps(idx *index, payload []byte, base, now int64) {
+	_ = walkOps(payload, func(o logOp) {
+		switch o.op {
+		case opPut, opPutTTL:
+			if expired(o.exp, now) {
+				idx.delete(o.key)
+			} else {
+				idx.set(o.key, base+int64(o.valPos), uint32(len(o.val)), o.exp)
+			}
 		case opDel:
-			idx.delete(key)
+			idx.delete(o.key)
 		case opDelRange:
 			var hi []byte
-			if vlen > 0 {
-				hi = payload[vpos : vpos+vlen]
+			if len(o.val) > 0 {
+				hi = o.val
 			}
-			idx.deleteRange(key, hi)
+			idx.deleteRange(o.key, hi)
 		}
 	})
 }
 
 type writeOp struct {
-	op       byte   // opPut, opDel or opDelRange
+	op       byte   // opPut, opDel or opDelRange (opPut with exp != 0 is written as opPutTTL)
 	key, val []byte // for opDelRange: lo, hi (nil = unbounded)
+	exp      int64  // expiry for puts, unix ns; 0 = never
 }
 
 // commitLocked writes ops as one atomic frame and applies them to the index.
@@ -350,10 +404,17 @@ func (db *DB) commitLocked(ops []writeOp) error {
 				continue
 			}
 		}
-		buf = append(buf, op.op)
+		code := op.op
+		if code == opPut && op.exp != 0 {
+			code = opPutTTL
+		}
+		buf = append(buf, code)
 		buf = binary.AppendUvarint(buf, uint64(len(op.key)))
 		buf = append(buf, op.key...)
-		if op.op != opDel {
+		if code == opPutTTL {
+			buf = binary.AppendUvarint(buf, uint64(op.exp))
+		}
+		if code != opDel {
 			buf = binary.AppendUvarint(buf, uint64(len(op.val)))
 			buf = append(buf, op.val...)
 		}
@@ -382,7 +443,7 @@ func (db *DB) commitLocked(ops []writeOp) error {
 	}
 
 	db.mu.Lock()
-	applyOps(db.idx, buf[frameHdr:], db.size+frameHdr)
+	applyOps(db.idx, buf[frameHdr:], db.size+frameHdr, db.now())
 	db.size += int64(len(buf))
 	db.mu.Unlock()
 
@@ -406,21 +467,21 @@ func (db *DB) failWrite(err error, poison bool) error {
 
 // --- store implementation (non-transactional, auto-commit) ---
 
-func (db *DB) get(key, dst []byte) ([]byte, bool, error) {
+func (db *DB) get(key, dst []byte) ([]byte, int64, bool, error) {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
 	if db.closed {
-		return dst, false, ErrClosed
+		return dst, 0, false, ErrClosed
 	}
 	n := db.idx.get(key)
-	if n == nil {
-		return dst, false, nil
+	if n == nil || n.exp != 0 && expired(n.exp, db.now()) { // read the clock only for TTL keys
+		return dst, 0, false, nil
 	}
 	dst = grow(dst[:0], int(n.vlen))
 	if err := readFull(db.f, dst, n.off); err != nil {
-		return dst, false, err
+		return dst, 0, false, err
 	}
-	return dst, true, nil
+	return dst, n.exp, true, nil
 }
 
 func (db *DB) commit1(op writeOp) error {
@@ -430,8 +491,10 @@ func (db *DB) commit1(op writeOp) error {
 	return db.commitLocked(ops[:])
 }
 
-func (db *DB) put(key, val []byte) error { return db.commit1(writeOp{op: opPut, key: key, val: val}) }
-func (db *DB) del(key []byte) error      { return db.commit1(writeOp{op: opDel, key: key}) }
+func (db *DB) put(key, val []byte, exp int64) error {
+	return db.commit1(writeOp{op: opPut, key: key, val: val, exp: exp})
+}
+func (db *DB) del(key []byte) error { return db.commit1(writeOp{op: opDel, key: key}) }
 func (db *DB) delRange(lo, hi []byte) error {
 	return db.commit1(writeOp{op: opDelRange, key: lo, val: hi})
 }
@@ -441,20 +504,40 @@ const (
 	scanChunkBytes = 1 << 20 // ...and max bytes, so large values can't blow up memory
 )
 
-// scan calls fn for each key in [lo, hi) in order (hi == nil: unbounded).
-// The k and v slices are only valid during the call.
+// scanOpts controls a scan.
+type scanOpts struct {
+	keysOnly bool // don't read values (fn receives empty v)
+	reverse  bool // descending key order
+}
+
+// scan calls fn for each live (unexpired) key in [lo, hi), in ascending or
+// descending order (hi == nil: unbounded). The k and v slices are only
+// valid during the call.
 //
 // Entries are read in chunks under the read lock and handed to fn with the
 // lock released, so fn may freely write to the database. The scan is
 // therefore not a point-in-time snapshot: each entry is a committed value,
 // but writes made during the scan may or may not be observed.
-func (db *DB) scan(lo, hi []byte, keysOnly bool, fn func(k, v []byte) bool) error {
+func (db *DB) scan(lo, hi []byte, o scanOpts, fn func(k, v []byte) bool) error {
 	var (
-		cur       = bytes.Clone(lo)
+		// Forward: cur is the next key to visit (inclusive on the first
+		// chunk). Reverse: cur is an exclusive upper bound (nil = none).
+		cur       []byte
 		inclusive = true
 		arena     []byte
 		spans     []int // k0start, k0end, v0end, k1start, ...
 	)
+	if o.reverse {
+		cur = bytes.Clone(hi)
+	} else {
+		cur = bytes.Clone(lo)
+	}
+	inRange := func(k []byte) bool {
+		if o.reverse {
+			return bytes.Compare(k, lo) >= 0
+		}
+		return hi == nil || bytes.Compare(k, hi) < 0
+	}
 	for {
 		arena, spans = arena[:0], spans[:0]
 		db.mu.RLock()
@@ -462,23 +545,39 @@ func (db *DB) scan(lo, hi []byte, keysOnly bool, fn func(k, v []byte) bool) erro
 			db.mu.RUnlock()
 			return ErrClosed
 		}
-		n := db.idx.seek(cur, nil)
-		if !inclusive && n != nil && bytes.Equal(n.key, cur) {
-			n = n.next[0]
+		now := db.now()
+		var n *node
+		if o.reverse {
+			n = db.idx.seekLT(cur)
+		} else {
+			n = db.idx.seek(cur, nil)
+			if !inclusive && n != nil && bytes.Equal(n.key, cur) {
+				n = n.next[0]
+			}
+		}
+		step := func(n *node) *node {
+			if o.reverse {
+				return n.prev
+			}
+			return n.next[0]
 		}
 		count := 0
 		for n != nil {
-			if hi != nil && bytes.Compare(n.key, hi) >= 0 {
+			if !inRange(n.key) {
 				n = nil // reached the end of the range
 				break
 			}
 			if count == scanChunk || (count > 0 && len(arena) >= scanChunkBytes) {
 				break // chunk full; n is where the next chunk starts
 			}
+			if expired(n.exp, now) {
+				n = step(n)
+				continue
+			}
 			ks := len(arena)
 			arena = append(arena, n.key...)
 			ke := len(arena)
-			if !keysOnly {
+			if !o.keysOnly {
 				arena = grow(arena, ke+int(n.vlen))
 				if err := readFull(db.f, arena[ke:], n.off); err != nil {
 					db.mu.RUnlock()
@@ -487,7 +586,7 @@ func (db *DB) scan(lo, hi []byte, keysOnly bool, fn func(k, v []byte) bool) erro
 			}
 			spans = append(spans, ks, ke, len(arena))
 			count++
-			n = n.next[0]
+			n = step(n)
 		}
 		more := n != nil
 		db.mu.RUnlock()
@@ -497,7 +596,7 @@ func (db *DB) scan(lo, hi []byte, keysOnly bool, fn func(k, v []byte) bool) erro
 				return nil
 			}
 		}
-		if !more {
+		if !more || len(spans) == 0 {
 			return nil
 		}
 		last := len(spans) - 3
@@ -507,6 +606,34 @@ func (db *DB) scan(lo, hi []byte, keysOnly bool, fn func(k, v []byte) bool) erro
 			arena = nil // one huge value: don't keep its buffer for the rest of the scan
 		}
 	}
+}
+
+// PurgeExpired drops expired entries from the in-memory index and returns
+// how many it removed. Expired entries are already invisible to reads; this
+// only frees their memory. It writes nothing: an expired put replays as a
+// delete. Compact also drops them and reclaims their disk space.
+func (db *DB) PurgeExpired() (int, error) {
+	db.wmu.Lock() // idx is stable while we hold wmu
+	defer db.wmu.Unlock()
+	if db.closed {
+		return 0, ErrClosed
+	}
+	now := db.now()
+	var dead [][]byte
+	for n := db.idx.first(); n != nil; n = n.next[0] {
+		if expired(n.exp, now) {
+			dead = append(dead, n.key)
+		}
+	}
+	const batch = 4096 // bound how long readers wait on the write lock
+	for i := 0; i < len(dead); i += batch {
+		db.mu.Lock()
+		for _, k := range dead[i:min(i+batch, len(dead))] {
+			db.idx.delete(k)
+		}
+		db.mu.Unlock()
+	}
+	return len(dead), nil
 }
 
 // Update runs fn inside a read-write transaction. All writes made through
@@ -536,7 +663,7 @@ func (db *DB) Update(fn func(tx *Tx) error) error {
 
 // Stats describes the database's size and garbage.
 type Stats struct {
-	Keys      int   // live keys across all buckets
+	Keys      int   // keys in the index, including expired ones not yet purged
 	FileBytes int64 // current log size
 	LiveBytes int64 // approximate bytes needed to store only live data
 	// TruncatedBytes is how much of a damaged tail was discarded on Open.
@@ -627,6 +754,7 @@ func (db *DB) copyLive(dst storage) (*index, int64, error) {
 	type pending struct {
 		kpos, klen, vpos int
 		vlen             uint32
+		exp              int64
 	}
 	var ents []pending
 
@@ -639,25 +767,36 @@ func (db *DB) copyLive(dst storage) (*index, int64, error) {
 			return err
 		}
 		for _, e := range ents {
-			newIdx.set(buf[e.kpos:e.kpos+e.klen], off+int64(e.vpos), e.vlen)
+			newIdx.set(buf[e.kpos:e.kpos+e.klen], off+int64(e.vpos), e.vlen, e.exp)
 		}
 		off += int64(len(buf))
 		buf, ents = buf[:frameHdr], ents[:0]
 		return nil
 	}
 
+	now := db.now()
 	for n := db.idx.first(); n != nil; n = n.next[0] {
-		buf = append(buf, opPut)
+		if expired(n.exp, now) {
+			continue // dropped: expired entries are not carried over
+		}
+		if n.exp != 0 {
+			buf = append(buf, opPutTTL)
+		} else {
+			buf = append(buf, opPut)
+		}
 		buf = binary.AppendUvarint(buf, uint64(len(n.key)))
 		kpos := len(buf)
 		buf = append(buf, n.key...)
+		if n.exp != 0 {
+			buf = binary.AppendUvarint(buf, uint64(n.exp))
+		}
 		buf = binary.AppendUvarint(buf, uint64(n.vlen))
 		vpos := len(buf)
 		buf = grow(buf, vpos+int(n.vlen))
 		if err := readFull(db.f, buf[vpos:], n.off); err != nil {
 			return nil, 0, err
 		}
-		ents = append(ents, pending{kpos, len(n.key), vpos, n.vlen})
+		ents = append(ents, pending{kpos, len(n.key), vpos, n.vlen, n.exp})
 		if len(buf) >= 4<<20 {
 			if err := flush(); err != nil {
 				return nil, 0, err

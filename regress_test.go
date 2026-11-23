@@ -263,7 +263,7 @@ func TestScanChunkBoundedByBytes(t *testing.T) {
 	runtime.GC()
 	runtime.ReadMemStats(&ms0)
 	seen := 0
-	must(t, db.scan(b.prefix, b.end, false, func(_, v []byte) bool {
+	must(t, db.scan(b.prefix, b.end, scanOpts{}, func(_, v []byte) bool {
 		if len(v) != size || v[0] != byte(seen) {
 			t.Fatalf("entry %d corrupt", seen)
 		}

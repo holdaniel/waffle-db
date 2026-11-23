@@ -45,6 +45,10 @@ orders := waffle.MustBucket[OrderKey, Order](db, "orders")
 
 it := orders.Prefix(OrderKey{Customer: "alice"}, 1) // all of alice's orders, by time
 for k, o := range it.Seq() { ... }
+
+// newest first, or just the latest one
+for k, o := range orders.Prefix(OrderKey{Customer: "alice"}, 1).Reverse().Seq() { ... }
+k, latest, ok, err := orders.Prefix(OrderKey{Customer: "alice"}, 1).Reverse().First()
 ```
 
 Every field of a key struct must be part of the key. An unexported field is rejected when the bucket is created, since two keys that differ only in that field would collide. Tag it `waffle:"-"` to leave it out on purpose.
@@ -68,8 +72,30 @@ The first time a bucket is created for a type `V`, reflection walks `V` **once**
 * **Failed writes:** if a write or fsync fails, the commit is rolled back out of the file, so a commit that returned an error can't reappear after a restart. After a failed fsync the database also refuses further writes (`ErrFailed`) until it is reopened. Reads keep working.
 * **One handle per file:** `Open` takes an exclusive `flock`, so a second open of the same file fails with `ErrLocked`, in the same process or another. The lock carries over to the new file when `Compact` replaces it. (On Windows there's no lock yet.)
 * **Compaction:** `db.Compact()` rewrites only live data to a temp file, fsyncs it and renames it into place. Readers keep running meanwhile.
+* **Bidirectional:** the skiplist keeps backward links, so any range can be iterated in descending order at the same cost as ascending.
 * **Concurrency:** many readers and one writer. Iteration reads in chunks (at most 128 entries or 1 MiB) and releases the lock between them, so you can write while you iterate without deadlocking, and large values can't exhaust memory.
 * **Range deletes:** `Clear` and `Namespace.Drop` write a single range-delete record. Their cost doesn't depend on how much data they remove.
+
+### TTL (expiring entries)
+
+```go
+idem := waffle.MustBucket[string, Result](db, "idempotency", waffle.WithTTL(24*time.Hour))
+idem.Put(requestID, res)                      // expires in 24h
+sessions.PutTTL(id, sess, 30*time.Minute)      // per-entry TTL
+sessions.Expire(id, 30*time.Minute)            // sliding expiration, value unchanged
+at, ok, _ := sessions.ExpiresAt(id)
+hits.Update(user, func(n int, _ bool) (int, error) { return n + 1, nil }) // keeps the existing expiry
+```
+
+Expiry is **lazy**. There is no background goroutine or scheduler:
+
+* Each entry stores an absolute expiry time (unix ns) in its log record and in the in-memory index.
+* Every read path (`Get`, `Has`, iteration, `Count`, transactions) compares it with the clock, so an entry is invisible from the instant it expires.
+* Nothing is written when an entry expires. On replay, an expired put counts as a delete, so it can't resurrect an older value of the same key.
+* Space is reclaimed on demand: `db.PurgeExpired()` frees index memory, and `db.Compact()` drops expired records from disk. Call them from your own ticker if you want periodic cleanup.
+* `Options.Now` replaces the clock, for testing expiry without sleeping.
+* `Put` replaces the TTL (a bucket without `WithTTL` clears it). `Update` keeps the existing expiry, like Redis `INCR`, so rate-limit windows don't slide.
+* If the system clock jumps backwards past an entry's expiry, the entry becomes visible again until the clock catches up.
 
 ### Layered key space
 
@@ -88,11 +114,13 @@ b.Get(k) (V, bool, error)      b.Put(k, v) error           b.Delete(k) error
 b.Has(k)                       b.Update(k, func(V, bool) (V, error)) error
 b.All() / b.Range(from, to) / b.From(k) / b.Prefix(partial, nFields)   // -> *Iter
 it.Seq() (keys and values)     it.Keys() (keys only)       it.Err()
+it.Reverse() (descending)      it.First() (K, V, bool, error)
+b.PutTTL(k, v, ttl)  b.Expire(k, ttl)  b.ExpiresAt(k)       WithTTL(d) bucket option
 b.Scan(Bounds[K]{From, To}, fn) error
 b.Count()  b.Clear()           b.In(tx)
 
-db.Update(func(tx *waffle.Tx) error)   db.Compact()   db.Stats()   db.Sync()   db.Close()
-waffle.OpenMemory()                    // same engine, in RAM: tests and caches
+db.Update(func(tx *waffle.Tx) error)   db.Compact()   db.PurgeExpired()   db.Stats()   db.Close()
+waffle.Open(waffle.MemoryPath, opts) / waffle.OpenMemory()   // same engine, in RAM
 ```
 
 Iteration never panics. It stops at the first error (I/O failure, corrupt data, a closed database or a finished transaction), and `it.Err()` reports it, the same way `bufio.Scanner` does.
@@ -105,8 +133,9 @@ CodecJSONAppend      306 ns/op   192 B/op   2 allocs/op
 CodecCompiledDecode  180 ns/op   104 B/op   6 allocs/op   (string fields must be allocated)
 CodecJSONDecode     1260 ns/op   400 B/op  12 allocs/op
 KeyEncodeStruct       14 ns/op     0 B/op   0 allocs/op
-Get (uint64→uint64)  696 ns/op     0 B/op   0 allocs/op   (file-backed, pread)
-Put (uint64→uint64) 2218 ns/op     1 B/op   0 allocs/op   (no fsync)
+Get (uint64→uint64)  668 ns/op     0 B/op   0 allocs/op   (file-backed, pread)
+Put (uint64→uint64) 2350 ns/op     2 B/op   0 allocs/op   (no fsync; PutTTL is the same)
+Iterate 10k, fwd    370 µs/op                            (reverse: 375 µs/op)
 ```
 
 Run them with `go test -bench=. -benchmem`.
@@ -116,5 +145,5 @@ Run them with `go test -bench=. -benchmem`.
 * The whole key set lives in memory (a Bitcask-style trade-off), so values can be much larger than RAM but keys can't. The natural next step is a paged B+tree or LSM index.
 * File locking is Unix-only; Windows needs `LockFileEx`.
 * Without `SyncWrites`, a power loss can leave a hole in the log with later frames intact, because the OS may reorder page writes. `Open` then reports corruption rather than guessing, and `TruncateCorrupt` recovers it.
-* Iteration is forward only and not a point-in-time snapshot.
-* Not done yet: reverse iteration, secondary indexes (`Index[V, IK]` derived from values), automatic compaction, and a `go generate` codec generator to remove the remaining closure-call overhead.
+* Iteration is not a point-in-time snapshot.
+* Not done yet: secondary indexes (`Index[V, IK]` derived from values), a change feed (`Watch`), optional background purge and compaction, and a `go generate` codec generator to remove the remaining closure-call overhead.

@@ -19,6 +19,7 @@ type Tx struct {
 type txWrite struct {
 	val []byte
 	del bool
+	exp int64 // expiry for puts, unix ns; 0 = never
 }
 
 type keyRange struct{ lo, hi []byte } // [lo, hi), hi == nil: unbounded
@@ -38,27 +39,27 @@ func (tx *Tx) rangeDeleted(k []byte) bool {
 	return false
 }
 
-func (tx *Tx) get(key, dst []byte) ([]byte, bool, error) {
+func (tx *Tx) get(key, dst []byte) ([]byte, int64, bool, error) {
 	if tx.done {
-		return dst, false, ErrTxDone
+		return dst, 0, false, ErrTxDone
 	}
 	if w, ok := tx.writes[string(key)]; ok {
-		if w.del {
-			return dst, false, nil
+		if w.del || expired(w.exp, tx.db.now()) {
+			return dst, 0, false, nil
 		}
-		return append(dst[:0], w.val...), true, nil
+		return append(dst[:0], w.val...), w.exp, true, nil
 	}
 	if tx.rangeDeleted(key) {
-		return dst, false, nil
+		return dst, 0, false, nil
 	}
 	return tx.db.get(key, dst)
 }
 
-func (tx *Tx) put(key, val []byte) error {
+func (tx *Tx) put(key, val []byte, exp int64) error {
 	if tx.done {
 		return ErrTxDone
 	}
-	tx.writes[string(key)] = txWrite{val: bytes.Clone(val)}
+	tx.writes[string(key)] = txWrite{val: bytes.Clone(val), exp: exp}
 	return nil
 }
 
@@ -87,8 +88,9 @@ func (tx *Tx) delRange(lo, hi []byte) error {
 	return nil
 }
 
-// scan merges the transaction's pending writes into the committed data.
-func (tx *Tx) scan(lo, hi []byte, keysOnly bool, fn func(k, v []byte) bool) error {
+// scan merges the transaction's pending writes into the committed data, in
+// either direction.
+func (tx *Tx) scan(lo, hi []byte, o scanOpts, fn func(k, v []byte) bool) error {
 	if tx.done {
 		return ErrTxDone
 	}
@@ -99,12 +101,25 @@ func (tx *Tx) scan(lo, hi []byte, keysOnly bool, fn func(k, v []byte) bool) erro
 		}
 	}
 	slices.Sort(pend)
+	if o.reverse {
+		slices.Reverse(pend)
+	}
+	// before reports whether pending key p comes before committed key k in
+	// iteration order.
+	before := func(p string, k []byte) bool {
+		c := strings.Compare(p, string(k))
+		if o.reverse {
+			return c > 0
+		}
+		return c < 0
+	}
 
+	now := tx.db.now()
 	i, stopped := 0, false
 	// emit yields a pending write; returns false if iteration must stop.
 	emit := func(k string) bool {
 		w := tx.writes[k]
-		if w.del {
+		if w.del || expired(w.exp, now) {
 			return true
 		}
 		if !fn(unsafe.Slice(unsafe.StringData(k), len(k)), w.val) {
@@ -113,8 +128,8 @@ func (tx *Tx) scan(lo, hi []byte, keysOnly bool, fn func(k, v []byte) bool) erro
 		}
 		return true
 	}
-	err := tx.db.scan(lo, hi, keysOnly, func(k, v []byte) bool {
-		for i < len(pend) && strings.Compare(pend[i], string(k)) < 0 {
+	err := tx.db.scan(lo, hi, o, func(k, v []byte) bool {
+		for i < len(pend) && before(pend[i], k) {
 			if !emit(pend[i]) {
 				return false
 			}
@@ -159,7 +174,7 @@ func (tx *Tx) ops() []writeOp {
 	}
 	for _, k := range keys {
 		w := tx.writes[k]
-		op := writeOp{op: opPut, key: []byte(k), val: w.val}
+		op := writeOp{op: opPut, key: []byte(k), val: w.val, exp: w.exp}
 		if w.del {
 			op.op = opDel
 		}
